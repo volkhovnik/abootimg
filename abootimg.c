@@ -61,7 +61,8 @@ enum command {
   info,
   extract,
   update,
-  create
+  create,
+  dtbs
 };
 
 
@@ -75,6 +76,8 @@ typedef struct
   char*        kernel_fname;
   char*        ramdisk_fname;
   char*        second_fname;
+  char*        dtbs_fname;
+  char*        signature_fname;
 
   FILE*        stream;
 
@@ -83,6 +86,11 @@ typedef struct
   char*        kernel;
   char*        ramdisk;
   char*        second;
+  void*        dtbh;
+  void**       dtbs;
+
+  char signature[255];
+
 } t_abootimg;
 
 
@@ -144,15 +152,17 @@ void print_usage(void)
  "\n"
  "      print boot image information\n"
  "\n"
- " abootimg -x <bootimg> [<bootimg.cfg> [<kernel> [<ramdisk> [<secondstage>]]]]\n"
+ " abootimg -x <bootimg> [<bootimg.cfg> [<kernel> [<ramdisk> [<secondstage>[<devicetrees>]]]]]\n"
  "\n"
  "      extract objects from boot image:\n"
  "      - config file (default name bootimg.cfg)\n"
  "      - kernel image (default name zImage)\n"
- "      - ramdisk image (default name initrd.img)\n"
+ "      - ramdisk image (default name initrd.gz)\n"
  "      - second stage image (default name stage2.img)\n"
+ "      - device trees (default name platform[.dtbh|.dtb_p#])\n"
+ "      - signature (default name signature )\n"
  "\n"
- " abootimg -u <bootimg> [-c \"param=value\"] [-f <bootimg.cfg>] [-k <kernel>] [-r <ramdisk>] [-s <secondstage>]\n"
+ " abootimg -u <bootimg> [-c \"param=value\"] [-f <bootimg.cfg>] [-k <kernel>] [-r <ramdisk>] [-s <secondstage>] [-d <dtbs>] [-g <signature>]\n"
  "\n"
  "      update a current boot image with objects given in command line\n"
  "      - header informations given in arguments (several can be provided)\n"
@@ -160,10 +170,11 @@ void print_usage(void)
  "      - kernel image\n"
  "      - ramdisk image\n"
  "      - second stage image\n"
+ "      - dtbs\n"
  "\n"
  "      bootimg has to be valid Android Boot Image, or the update will abort.\n"
  "\n"
- " abootimg --create <bootimg> [-c \"param=value\"] [-f <bootimg.cfg>] -k <kernel> -r <ramdisk> [-s <secondstage>]\n"
+ " abootimg --create <bootimg> [-c \"param=value\"] [-f <bootimg.cfg>] -k <kernel> -r <ramdisk> [-s <secondstage>] [-d <dtbs>] [-g <signature>]\n"
  "\n"
  "      create a new image from scratch.\n"
  "      if the boot image file is a block device, sanity check will be performed to avoid overwriting a existing\n"
@@ -171,6 +182,10 @@ void print_usage(void)
  "\n"
  "      argurments are the same than for -u.\n"
  "      kernel and ramdisk are mandatory.\n"
+ "\n"
+ " abootimg --dtbs <platform.dbts>\n"
+ "\n"
+ "      print device tree header information\n"
  "\n"
     );
 }
@@ -199,6 +214,9 @@ enum command parse_args(int argc, char** argv, t_abootimg* img)
   else if (!strcmp(argv[1], "--create")) {
     cmd=create;
   }
+  else if (!strcmp(argv[1], "--dtbs")) {
+    cmd=dtbs;
+  }
   else
     return none;
 
@@ -225,6 +243,10 @@ enum command parse_args(int argc, char** argv, t_abootimg* img)
         img->ramdisk_fname = argv[5];
       if (argc >= 7)
         img->second_fname = argv[6];
+      if (argc >= 8)
+        img->dtbs_fname = argv[7];
+      if (argc >= 9)
+        img->signature_fname = argv[8];
       break;
 
     case update:
@@ -236,6 +258,9 @@ enum command parse_args(int argc, char** argv, t_abootimg* img)
       img->kernel_fname = NULL;
       img->ramdisk_fname = NULL;
       img->second_fname = NULL;
+      img->dtbs_fname = NULL;
+      img->signature_fname = NULL;
+
       for(i=3; i<argc; i++) {
         if (!strcmp(argv[i], "-c")) {
           if (++i >= argc)
@@ -266,9 +291,24 @@ enum command parse_args(int argc, char** argv, t_abootimg* img)
             return none;
           img->second_fname = argv[i];
         }
+        else if (!strcmp(argv[i], "-d")) {
+          if (++i >= argc)
+            return none;
+          img->dtbs_fname = argv[i];
+        }
+        else if (!strcmp(argv[i], "-g")) {
+          if (++i >= argc)
+            return none;
+          img->signature_fname = argv[i];
+        }
         else
           return none;
       }
+      break;
+    case dtbs:
+      if (argc != 3)
+        return none;
+      img->fname = argv[2];
       break;
   }
   
@@ -300,14 +340,17 @@ int check_boot_img_header(t_abootimg* img)
     return 1;
   }
 
+  // warning, page size is not of valid size?
+
   unsigned n = (img->header.kernel_size + page_size - 1) / page_size;
   unsigned m = (img->header.ramdisk_size + page_size - 1) / page_size;
   unsigned o = (img->header.second_size + page_size - 1) / page_size;
+  unsigned p = (img->header.dtbs_size + page_size - 1) / page_size;
 
-  unsigned total_size = (1+n+m+o)*page_size;
+  unsigned total_size = (1+n+m+o+p)*page_size;
 
   if (total_size > img->size) {
-    fprintf(stderr, "%s: sizes mismatches in boot image\n", img->fname);
+    fprintf(stderr, "%s: sizes mismatches\n  total_size %u != img size %u\n", img->fname, total_size, img->size);
     return 1;
   }
 
@@ -512,6 +555,7 @@ void update_images(t_abootimg *img)
   unsigned ksize = img->header.kernel_size;
   unsigned rsize = img->header.ramdisk_size;
   unsigned ssize = img->header.second_size;
+  unsigned dsize = img->header.dtbs_size;
 
   if (!page_size)
     abort_printf("%s: Image page size is null\n", img->fname);
@@ -519,9 +563,11 @@ void update_images(t_abootimg *img)
   unsigned n = (ksize + page_size - 1) / page_size;
   unsigned m = (rsize + page_size - 1) / page_size;
   unsigned o = (ssize + page_size - 1) / page_size;
+  unsigned p = (dsize + page_size - 1) / page_size;
 
   unsigned roffset = (1+n)*page_size;
   unsigned soffset = (1+n+m)*page_size;
+  unsigned doffset = (1+n+m+o)*page_size;
 
   if (img->kernel_fname) {
     printf("reading kernel from %s\n", img->kernel_fname);
@@ -568,6 +614,9 @@ void update_images(t_abootimg *img)
   }
   else if (img->kernel) {
     // if kernel is updated, copy the ramdisk from original image
+
+    printf (" copy  ramdisk %u bytes from 0x%08x\n", rsize, roffset);
+
     char* r = malloc(rsize);
     if (!r)
       abort_perror("");
@@ -604,6 +653,8 @@ void update_images(t_abootimg *img)
   }
   else if (img->ramdisk && img->header.second_size) {
     // if ramdisk is updated, copy the second stage from original image
+    printf (" copy second %u bytes from 0x%08x\n", ssize, soffset);
+
     char* s = malloc(ssize);
     if (!s)
       abort_perror("");
@@ -617,10 +668,141 @@ void update_images(t_abootimg *img)
     img->second = s;
   }
 
+  if (img->dtbs_fname) {
+    printf("reading dtbs ...\n");
+
+    char dtbname[256] = {0};
+
+    sprintf(dtbname, "%s.dtbh", img->dtbs_fname);
+
+    printf(".. DTBH from %s\n",dtbname);
+
+    // open dtbh file
+    FILE* stream = fopen(dtbname, "r");
+    if (!stream)
+      abort_perror(dtbname);
+    //get size of dtbh file
+    struct stat st;
+    if (fstat(fileno(stream), &st))
+      abort_perror(dtbname);
+    dsize = st.st_size;
+
+    //alloc memmory and clear for dtbh (not more than 1 pagesize)
+    //char* d = malloc(dsize);
+    char* d = calloc(page_size,1);
+
+    if (!d)
+      abort_perror("");
+    // read
+    size_t rb = fread(d, dsize, 1, stream);
+    if ((rb!=1) || ferror(stream))
+      abort_perror(dtbname);
+    else if (feof(stream))
+      abort_printf("%s: cannot read DTBH\n", dtbname);
+
+    //store DTBH pointer to image
+    img->dtbh = d;
+
+
+    // alloc and load each dtbs
+    dtbs_t *dtbh = (dtbs_t *)d;
+
+    // alloc ptr table for dtbs
+    img->dtbs = (void **)malloc(dtbh->num_entries * sizeof(void*));
+
+    // entryes
+    dt_entry_t *dt = (dt_entry_t *)(d + sizeof(dtbs_t));
+
+    int ientry;
+    for (ientry = 0, p = 1; ientry<dtbh->num_entries; ientry++) {
+      // generate dtb name
+      sprintf(dtbname,"%s.dtb_p%d",img->dtbs_fname, ientry);
+
+      //printf(".. dtb from %s\n",dtbname);
+      printf (" .. dtb %s offset 0x%08x, size 0x%08x\n", dtbname, dt[ientry].offset, dt[ientry].dtb_size);
+
+      FILE* dtbs_file = fopen(dtbname, "r");
+      if (!dtbs_file)
+        abort_perror(dtbname);
+
+      //get size of dtb file
+      struct stat st;
+      if (fstat(fileno(dtbs_file), &st))
+        abort_perror(dtbname);
+
+      void* dp = (void *)malloc(st.st_size);
+
+      // read dtb file
+      size_t rb = fread(dp, st.st_size, 1, dtbs_file);
+
+      if ((rb!=1) || ferror(dtbs_file))
+        abort_perror(dtbname);
+      else if (feof(dtbs_file))
+        abort_printf("%s: cannot read DTB\n", dtbname);
+
+      // store dtb to image table
+      img->dtbs[ientry] = dp;
+
+      // update size of dtb
+      dt[ientry].offset = p * page_size;
+      dt[ientry].dtb_size = st.st_size; // need to be alse page-multiple
+
+      printf (" .. new offset 0x%08x, size 0x%08x\n", dt[ientry].offset, dt[ientry].dtb_size);
+
+      // update header dtbs p pages count (for next loop)
+      p+=  (st.st_size + page_size - 1) / page_size;
+    }; // for loop
+
+    // update header dtbs_size
+    img->header.dtbs_size = p * page_size;
+  }
+  else if (img->header.dtbs_size) {
+    printf (" copy  dtbs %u bytes from 0x%08x\n", dsize, doffset);
+
+    // if *** is updated, copy the dtbs from original image
+    char* d = malloc(dsize);
+    if (!d)
+      abort_perror("");
+    if (fseek(img->stream, doffset, SEEK_SET))
+      abort_perror(img->fname);
+    size_t rb = fread(d, dsize, 1, img->stream);
+    if ((rb!=1) || ferror(img->stream))
+      abort_perror(img->fname);
+    else if (feof(img->stream))
+      abort_printf("%s: cannot read dtts\n", img->fname);
+
+
+    // store dtb structure header
+    img->dtbh = d;
+
+    // populate dtbs table
+    dtbs_t *dtbh = (dtbs_t *)d;
+
+    // alloc ptr table for dtbs
+    img->dtbs = (void **)malloc(dtbh->num_entries * sizeof(void*));
+
+    // entryes
+    dt_entry_t *dt = (dt_entry_t *)(d + sizeof(dtbs_t));
+
+    int ientry;
+    for (ientry = 0; ientry<dtbh->num_entries; ientry++) {
+
+      // store dtb to image table
+      img->dtbs[ientry] = (void*)(d + dt[ientry].offset);
+    };
+  }
+
+  // update signature? (read from file, or memory)
+  // offset is (1+n+m+o+p)
+  memcpy(img->signature, "SEANDROIDENFORCE", sizeof("SEANDROIDENFORCE"));
+
+
   n = (img->header.kernel_size + page_size - 1) / page_size;
   m = (img->header.ramdisk_size + page_size - 1) / page_size;
   o = (img->header.second_size + page_size - 1) / page_size;
-  unsigned total_size = (1+n+m+o)*page_size;
+  p = (img->header.dtbs_size + page_size - 1) / page_size;
+
+  unsigned total_size = (1+n+m+o+p+1)*page_size;
 
   if (!img->size)
     img->size = total_size;
@@ -644,7 +826,10 @@ void write_bootimg(t_abootimg* img)
 
   unsigned n = (img->header.kernel_size + psize - 1) / psize;
   unsigned m = (img->header.ramdisk_size + psize - 1) / psize;
-  //unsigned o = (img->header.second_size + psize - 1) / psize;
+  unsigned o = (img->header.second_size + psize - 1) / psize;
+  unsigned p = (img->header.dtbs_size + psize - 1) / psize;
+
+  printf ("   header %zu\n", sizeof(img->header));
 
   if (fseek(img->stream, 0, SEEK_SET))
     abort_perror(img->fname);
@@ -658,6 +843,8 @@ void write_bootimg(t_abootimg* img)
     abort_perror(img->fname);
 
   if (img->kernel) {
+    printf ("   kernel %u at 0x%08x\n", img->header.kernel_size, psize);
+
     fwrite(img->kernel, img->header.kernel_size, 1, img->stream);
     if (ferror(img->stream))
       abort_perror(img->fname);
@@ -668,6 +855,8 @@ void write_bootimg(t_abootimg* img)
   }
 
   if (img->ramdisk) {
+    printf ("   ramdisk %u at 0x%08x\n", img->header.ramdisk_size, (1+n)*psize);
+
     if (fseek(img->stream, (1+n)*psize, SEEK_SET))
       abort_perror(img->fname);
 
@@ -681,6 +870,8 @@ void write_bootimg(t_abootimg* img)
   }
 
   if (img->header.second_size) {
+    printf ("   second %u at 0x%08x\n", img->header.second_size, (1+n+m)*psize);
+
     if (fseek(img->stream, (1+n+m)*psize, SEEK_SET))
       abort_perror(img->fname);
 
@@ -693,7 +884,61 @@ void write_bootimg(t_abootimg* img)
       abort_perror(img->fname);
   }
 
-  ftruncate (fileno(img->stream), img->size);
+  // write dtbs to stream
+  if (img->dtbh) {
+    printf ("   dtbs %u at 0x%08x\n", img->header.dtbs_size, (1+n+m+o)*psize);
+
+    // go to at beginig of DTBH
+    if (fseek(img->stream, (1+n+m+o)*psize, SEEK_SET))
+      abort_perror(img->fname);
+
+    // write DTBH
+    fwrite(img->dtbh, psize, 1, img->stream);
+    if (ferror(img->stream))
+      abort_perror(img->fname);
+
+    // populate dtbs table
+    dtbs_t *dtbh = (dtbs_t *)img->dtbh;
+
+    // entryes
+    dt_entry_t *dt = (dt_entry_t *)(((char*)img->dtbh) + sizeof(dtbs_t));
+
+    int ientry;
+    for (ientry = 0; ientry<dtbh->num_entries; ientry++) {
+
+      // wtire dtb to stream
+      fwrite(img->dtbs[ientry], dt[ientry].dtb_size, 1, img->stream);
+      if (ferror(img->stream))
+        abort_perror(img->fname);
+
+      if ((dt[ientry].dtb_size % psize) > 0) {
+        printf ("   . dtb padding for %u is %u because %u\n", dt[ientry].dtb_size, psize - (dt[ientry].dtb_size % psize), dt[ientry].dtb_size % psize);
+        fwrite(padding, psize - (dt[ientry].dtb_size % psize), 1, img->stream);
+      };
+
+      if (ferror(img->stream))
+        abort_perror(img->fname);
+    };
+
+  }
+
+
+  // update signature
+  printf ("   signature %zu at 0x%08x\n", sizeof(img->signature), (1+n+m+o+p)*psize);
+  // write signature
+  if (fseek(img->stream, (1+n+m+o+p)*psize, SEEK_SET))
+    abort_perror(img->fname);
+
+  fwrite(img->signature, sizeof(img->signature), 1, img->stream);
+  if (ferror(img->stream))
+    abort_perror(img->fname);
+
+  fwrite(padding, psize - (sizeof(img->signature) % psize), 1, img->stream);
+  if (ferror(img->stream))
+    abort_perror(img->fname);
+
+
+  //ftruncate (fileno(img->stream), img->size);
 
   free(padding);
 }
@@ -707,36 +952,135 @@ void print_bootimg_info(t_abootimg* img)
   printf ("* file name = %s %s\n\n", img->fname, img->is_blkdev ? "[block device]":"");
 
   printf ("* image size = %u bytes (%.2f MB)\n", img->size, (double)img->size/0x100000);
-  printf ("  page size  = %u bytes\n\n", img->header.page_size);
+  //printf ("  page size  = %u bytes\n\n", img->header.page_size);
 
-  printf ("* Boot Name = \"%s\"\n\n", img->header.name);
+  printf ("\n<boot_img_hdr>\n");
 
   unsigned kernel_size = img->header.kernel_size;
   unsigned ramdisk_size = img->header.ramdisk_size;
   unsigned second_size = img->header.second_size;
 
-  printf ("* kernel size       = %u bytes (%.2f MB)\n", kernel_size, (double)kernel_size/0x100000);
-  printf ("  ramdisk size      = %u bytes (%.2f MB)\n", ramdisk_size, (double)ramdisk_size/0x100000);
-  if (second_size)
-    printf ("  second stage size = %u bytes (%.2f MB)\n", ramdisk_size, (double)ramdisk_size/0x100000);
- 
-  printf ("\n* load addresses:\n");
-  printf ("  kernel:       0x%08x\n", img->header.kernel_addr);
-  printf ("  ramdisk:      0x%08x\n", img->header.ramdisk_addr);
-  if (second_size)
-    printf ("  second stage: 0x%08x\n", img->header.second_addr);
-  printf ("  tags:         0x%08x\n\n", img->header.tags_addr);
+  unsigned page_size  = img->header.page_size;
 
+  unsigned dts_size = img->header.dtbs_size;
+
+  // pages
+  unsigned n_pages = (kernel_size + page_size-1) / page_size;
+  unsigned m_pages = (ramdisk_size + page_size-1) / page_size;
+  unsigned o_pages = (second_size + page_size-1) / page_size;
+  unsigned p_pages = (dts_size + page_size-1) / page_size;
+
+
+  //printf ("   magic:        %s\n", img->header.magic);
+
+  printf ("   kernel_size:  %u bytes (%.2f MB), %u pages\n", kernel_size, (double)kernel_size/0x100000, n_pages);
+  printf ("   kernel_addr:  0x%08x\n", img->header.kernel_addr); /* physical load addr */
+
+  printf ("   ramdisk_size: %u bytes (%.2f MB), %u pages\n", ramdisk_size, (double)ramdisk_size/0x100000, m_pages);
+  printf ("   ramdisk_addr: 0x%08x\n", img->header.ramdisk_addr); /* physical load addr */
+
+  printf ("   second_size:  %u bytes (%.2f MB), %u pages\n", second_size, (double)second_size/0x100000, o_pages);
+  printf ("   second_addr:  0x%08x\n", img->header.second_addr); /* physical load addr */
+
+  printf ("   tags_addr:    0x%08x\n", img->header.tags_addr); /* physical addr for kernel tags */
+  printf ("   page_size:    %u bytes\n", img->header.page_size); /* flash page size we assume */
+
+  printf ("   dtbs_size:    %u bytes (%.2f MB), %u pages\n", dts_size, (double)dts_size/0x100000, p_pages);
+
+  printf ("   unused[0]:    %u \n", img->header.unused[0]); /* future expansion: should be 0 */
+
+  printf ("   name:         %s\n\n", img->header.name);
+
+  //printf ("   cmdline: %s\n");
   if (img->header.cmdline[0])
-    printf ("* cmdline = %s\n\n", img->header.cmdline);
+    printf ("   cmdline:      %s\n\n", img->header.cmdline);
   else
-    printf ("* empty cmdline\n");
+    printf ("   cmdline       empty\n\n");
 
-  printf ("* id = ");
-  int i;
-  for (i=0; i<8; i++)
-    printf ("0x%08x ", img->header.id[i]);
-  printf ("\n\n");
+  printf ("   id[8] 0x%04X%04X%04X%04X%04X%04X%04X%04X\n",
+    img->header.id[0],img->header.id[1],img->header.id[2],img->header.id[3],
+    img->header.id[4],img->header.id[5],img->header.id[6],img->header.id[7]
+  ); /* timestamp / checksum / sha1 / etc */
+
+  printf ("\n<boot_img layout>\n");
+
+  unsigned offset = ((sizeof(img->header) + page_size-1) / page_size); // initial offset of header, one page is more than enough
+
+  unsigned kernel_offset = offset * page_size; offset += n_pages;
+  unsigned ramdisk_offset = offset * page_size; offset += m_pages;
+  unsigned second_offset = offset * page_size; offset += o_pages;
+  unsigned dts_offset = offset * page_size; offset += p_pages; // for the signature
+  unsigned signature_offset = offset * page_size;
+
+  printf ("   kernel offset     0x%08x\n", kernel_offset);
+  printf ("   ramdisk offset:   0x%08x\n", ramdisk_offset);
+  printf ("   secondary offset: 0x%08x\n", second_offset);
+  printf ("   dtbs offset:      0x%08x\n", dts_offset);
+  printf ("   signature offset: 0x%08x\n", signature_offset);
+
+  printf ("\n");
+}
+
+
+void print_dtbh_info(t_abootimg* img)
+{
+  unsigned page_size = img->header.page_size;
+
+  unsigned ksize = img->header.kernel_size;
+  unsigned rsize = img->header.ramdisk_size;
+  unsigned ssize = img->header.second_size;
+  unsigned dsize = img->header.dtbs_size;
+
+  unsigned n = (ksize + page_size - 1) / page_size;
+  unsigned m = (rsize + page_size - 1) / page_size;
+  unsigned o = (ssize + page_size - 1) / page_size;
+  //unsigned p = (dsize + page_size - 1) / page_size;
+
+  //unsigned roffset = (1+n)*page_size;
+  //unsigned soffset = (1+n+m)*page_size;
+  unsigned doffset = (1+n+m+o)*page_size;
+
+  //printf (" copy  dtbs %u bytes from 0x%08x\n", dsize, doffset);
+
+  char* d = malloc(dsize);
+  if (!d)
+    abort_perror("");
+  if (fseek(img->stream, doffset, SEEK_SET))
+    abort_perror(img->fname);
+  size_t rb = fread(d, dsize, 1, img->stream);
+  if ((rb!=1) || ferror(img->stream))
+    abort_perror(img->fname);
+  else if (feof(img->stream))
+    abort_printf("%s: cannot read dtbs\n", img->fname);
+
+  dtbs_t *dtbh = (dtbs_t *)d;
+
+  printf ("\n<dtbh_header Info>\n");
+  printf ("  magic:0x%08x, version:0x%08x, num_entries:0x%08x\n",
+    dtbh->magic, dtbh->version, dtbh->num_entries);
+
+/*
+  printf ("\n<device info>\n");
+  printf ("        chip_id: 0x%08x\n", dtbh->device_info.chip_id);
+  printf ("    platform_id: 0x%08x\n", dtbh->device_info.platform_id);
+  printf ("     subtype_id: 0x%08x\n", dtbh->device_info.subtype_id);
+  printf ("         hw_rev: 0x%08x\n", dtbh->device_info.hw_rev);
+*/
+
+  dt_entry_t *dt = (dt_entry_t *)(d + sizeof(dtbs_t));
+  int ientry;
+  for (ientry = 0; ientry<dtbh->num_entries; ientry++) {
+    printf ("\ndt_entry[%02d]\n", ientry);
+    printf ("        chip_id: 0x%08x\n", dt[ientry].chip_id);
+    printf ("    platform_id: 0x%08x\n", dt[ientry].platform_id);
+    printf ("     subtype_id: 0x%08x\n", dt[ientry].subtype_id);
+    printf ("         hw_rev: 0x%08x\n", dt[ientry].hw_rev);
+    printf ("     hw_rev_end: 0x%08x\n", dt[ientry].hw_rev_end);
+    printf ("         offset: 0x%08x\n", dt[ientry].offset);
+    printf ("       dtb size: 0x%08x\n", dt[ientry].dtb_size);
+  }
+
+  printf ("\n");
 }
 
 
@@ -796,7 +1140,6 @@ void extract_kernel(t_abootimg* img)
 }
 
 
-
 void extract_ramdisk(t_abootimg* img)
 {
   unsigned psize = img->header.page_size;
@@ -832,7 +1175,6 @@ void extract_ramdisk(t_abootimg* img)
 }
 
 
-
 void extract_second(t_abootimg* img)
 {
   unsigned psize = img->header.page_size;
@@ -848,7 +1190,7 @@ void extract_second(t_abootimg* img)
 
   printf ("extracting second stage image in %s\n", img->second_fname);
 
-  void* s = malloc(ksize);
+  void* s = malloc(ssize);
   if (!s)
     abort_perror(NULL);
 
@@ -872,6 +1214,101 @@ void extract_second(t_abootimg* img)
 }
 
 
+void extract_dtbs(t_abootimg* img)
+{
+  unsigned psize = img->header.page_size;
+  unsigned ksize = img->header.kernel_size;
+  unsigned rsize = img->header.ramdisk_size;
+  unsigned ssize = img->header.second_size;
+  unsigned dsize = img->header.dtbs_size;
+
+  unsigned n = (ksize + rsize + ssize + psize-1) / psize;
+  unsigned doffset = (1+n)*psize;
+
+  printf ("extracting ");
+
+  void* d = malloc(dsize);
+  if (!d)
+    abort_perror(NULL);
+
+  if (fseek(img->stream, doffset, SEEK_SET))
+    abort_perror(img->fname);
+
+  size_t rb = fread(d, dsize, 1, img->stream);
+  if ((rb!=1) || ferror(img->stream))
+    abort_perror(img->fname);
+
+  char dtbname[256] = {0};
+
+  sprintf(dtbname,"%s.dtbh",img->dtbs_fname);
+
+  printf ("DTBH %s\n", dtbname);
+
+  // load header of dtbh
+  dtbs_t *dtbh = (dtbs_t *)d;
+
+  FILE* dtbs_file = fopen(dtbname, "w");
+  if (!dtbs_file)
+    abort_perror(dtbname);
+
+  unsigned dtbhsize = sizeof(dtbs_t) + sizeof(dt_entry_t) * dtbh->num_entries;
+  fwrite(d, dtbhsize, 1, dtbs_file);
+  if (ferror(dtbs_file))
+    abort_perror(dtbname);
+
+  fclose(dtbs_file);
+
+  dt_entry_t *dt = (dt_entry_t *)(d + sizeof(dtbs_t));
+
+  int ientry;
+
+  for (ientry = 0; ientry<dtbh->num_entries; ientry++) {
+    sprintf(dtbname,"%s.dtb_p%d",img->dtbs_fname,ientry);
+
+    printf (" .. dtb %s offset 0x%08x, size 0x%08x\n", dtbname, dt[ientry].offset, dt[ientry].dtb_size);
+
+    FILE* dtbs_file = fopen(dtbname, "w");
+    if (!dtbs_file)
+      abort_perror(dtbname);
+
+    fwrite((d + dt[ientry].offset), dt[ientry].dtb_size, 1, dtbs_file);
+    if (ferror(dtbs_file))
+      abort_perror(dtbname);
+    fclose(dtbs_file);
+  }
+  free(d);
+}
+
+
+void extract_signature(t_abootimg* img)
+{
+/*  unsigned psize = img->header.page_size;
+  unsigned zsize = 256;
+
+  printf ("extracting signature in %s\n", img->signature_fname);
+
+  void* k = malloc(ksize);
+  if (!k)
+    abort_perror(NULL);
+
+  if (fseek(img->stream, psize, SEEK_SET))
+    abort_perror(img->fname);
+
+  size_t rb = fread(k, ksize, 1, img->stream);
+  if ((rb!=1) || ferror(img->stream))
+    abort_perror(img->fname);
+
+  FILE* kernel_file = fopen(img->kernel_fname, "w");
+  if (!kernel_file)
+    abort_perror(img->kernel_fname);
+
+  fwrite(k, ksize, 1, kernel_file);
+  if (ferror(kernel_file))
+    abort_perror(img->kernel_fname);
+
+  fclose(kernel_file);
+  free(k);*/
+}
 
 t_abootimg* new_bootimg()
 {
@@ -883,8 +1320,10 @@ t_abootimg* new_bootimg()
 
   img->config_fname = "bootimg.cfg";
   img->kernel_fname = "zImage";
-  img->ramdisk_fname = "initrd.img";
+  img->ramdisk_fname = "initrd.gz";
   img->second_fname = "stage2.img";
+  img->dtbs_fname = "platform";
+  img->signature_fname = "signature";
 
   memcpy(img->header.magic, BOOT_MAGIC, BOOT_MAGIC_SIZE);
   img->header.page_size = 2048;  // a sensible default page size
@@ -921,6 +1360,8 @@ int main(int argc, char** argv)
       extract_kernel(bootimg);
       extract_ramdisk(bootimg);
       extract_second(bootimg);
+      extract_dtbs(bootimg);
+      extract_signature(bootimg);
       break;
     
     case update:
@@ -928,6 +1369,7 @@ int main(int argc, char** argv)
       read_header(bootimg);
       update_header(bootimg);
       update_images(bootimg);
+      //print_bootimg_info(bootimg);
       write_bootimg(bootimg);
       break;
 
@@ -943,6 +1385,11 @@ int main(int argc, char** argv)
       if (check_boot_img_header(bootimg))
         abort_printf("%s: Sanity cheks failed", bootimg->fname);
       write_bootimg(bootimg);
+      break;
+    case dtbs:
+      open_bootimg(bootimg, "r");
+      read_header(bootimg);
+      print_dtbh_info(bootimg);
       break;
   }
 

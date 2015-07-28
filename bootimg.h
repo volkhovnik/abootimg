@@ -40,7 +40,10 @@ struct boot_img_hdr
 
     unsigned tags_addr;    /* physical addr for kernel tags */
     unsigned page_size;    /* flash page size we assume */
-    unsigned unused[2];    /* future expansion: should be 0 */
+
+    unsigned dtbs_size;    /* size in bytes */
+
+    unsigned unused[1];    /* future expansion: should be 0 */
 
     unsigned char name[BOOT_NAME_SIZE]; /* asciiz product name */
     
@@ -59,10 +62,15 @@ struct boot_img_hdr
 ** +-----------------+
 ** | second stage    | o pages
 ** +-----------------+
+** | device trees    | p pages
+** +-----------------+
+** | signature       | 1 pages
+** +-----------------+
 **
 ** n = (kernel_size + page_size - 1) / page_size
 ** m = (ramdisk_size + page_size - 1) / page_size
 ** o = (second_size + page_size - 1) / page_size
+** p = (dtbs_size + page_size - 1) / page_size
 **
 ** 0. all entities are page_size aligned in flash
 ** 1. kernel and ramdisk are required (size != 0)
@@ -93,5 +101,106 @@ struct ptentry {
 **         <ptentry> x n
 */
 #endif
+
+
+typedef struct device_info_t device_info_t;
+
+struct device_info_t {
+  unsigned chip_id;
+  unsigned platform_id;
+  unsigned subtype_id;
+  unsigned hw_rev;
+};
+
+typedef struct dt_entry_t dt_entry_t;
+struct dt_entry_t {
+  unsigned chip_id;
+  unsigned platform_id;
+  unsigned subtype_id;
+  unsigned hw_rev;
+  unsigned hw_rev_end;
+  unsigned offset;
+  unsigned dtb_size;
+  char padding[2];
+};
+
+typedef struct dtbs_t dtbs_t;
+
+struct dtbs_t {
+  unsigned magic;
+  unsigned version;
+  unsigned num_entries;
+  //device_info_t device_info;
+};
+
+
+/*<dtbh_header Info>
+    magic:0x48425444, version:0x00000002, num_entries:0x00000009
+
+<device info>
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x0000000b
+
+dt_entry[00]
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x00000000
+     hw_rev_end: 0x00000000
+         offset: 0x00000800
+       dtb size: 0x0002b000
+dt_entry[01]
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x00000003
+     hw_rev_end: 0x00000003
+         offset: 0x0002b800
+       dtb size: 0x0002b800
+dt_entry[02]
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x00000005
+     hw_rev_end: 0x00000005
+         offset: 0x00057000
+       dtb size: 0x0002c000
+dt_entry[03]
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x00000006
+     hw_rev_end: 0x00000006
+         offset: 0x00083000
+       dtb size: 0x0002c000
+dt_entry[04]
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x00000007
+     hw_rev_end: 0x00000007
+         offset: 0x000af000
+       dtb size: 0x0002c000
+dt_entry[05]
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x00000008
+     hw_rev_end: 0x00000009
+         offset: 0x000db000
+       dtb size: 0x0002c000
+dt_entry[06]
+        chip_id: 0x00001cfc
+    platform_id: 0x000050a6
+     subtype_id: 0x217584da
+         hw_rev: 0x0000000a
+     hw_rev_end: 0x0000000b
+         offset: 0x00107000
+       dtb size: 0x0002c000
+Selected entry hw_ver : 11
+dt_entry of hw_rev 10 is loaded at 0x4a000000.(180224 Bytes)
+*/
 
 #endif
